@@ -1,0 +1,1547 @@
+<title>하얀 버튼</title>
+<!-- One self-contained file on purpose: it has to travel to a phone as a single page. -->
+<style>
+  /* Paper-white full-bleed canvas. Everything is drawn; nothing is written. */
+  :root { --paper: #ffffff; color-scheme: light; }
+  html, body { height: 100%; margin: 0; background: var(--paper); overflow: hidden; overscroll-behavior: none; }
+  body { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+  #stage { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; background: var(--paper); }
+</style>
+<canvas id="stage"></canvas>
+<script>
+(() => {
+  'use strict';
+
+  // ---------- tuning ----------
+  const TAU = Math.PI * 2;
+  const ERA_LENGTH = 22;              // interaction points needed to finish one era
+  const MAX_ENTITIES = 32;
+  const MAX_PARTICLES = 380;
+  const TAP_MAX_MOVE = 14;
+  const TAP_MAX_MS = 450;
+  const SHAKE_REVERSALS = 4;
+  const SHAKE_WINDOW_MS = 800;
+  const SHAKE_COOLDOWN_MS = 450;
+  const DEVICE_SHAKE_ACCEL = 16;
+  const DEVICE_SHAKE_COOLDOWN_MS = 800;
+  const BUTTON_R = 36;
+  const FINALE_BUTTON_R = 70;
+  const BPM = 124;
+  const OUTLINE = '#2b2226';
+  const TRANSITIONS = [
+    { dur: 2.6, convertAt: 0.6 },
+    { dur: 2.2, convertAt: 0.55 },
+    { dur: 2.0, convertAt: 0.55 },
+  ];
+  const FINALE = { dance: 3.4, vacuum: 5.4, end: 6.2 };
+  // eras: 0 scary, 1 cute, 2 grotesque, 3 funny; each era unlocks kinds in three stages
+  const SPAWN_STAGES = [
+    [['eye'], ['eye', 'shade'], ['shade', 'hand', 'eye']],
+    [['mochi'], ['mochi', 'egg'], ['mochi', 'egg', 'ghostie']],
+    [['flesh'], ['flesh', 'worm'], ['worm', 'lipflower', 'flesh']],
+    [['groucho'], ['groucho', 'chicken'], ['chicken', 'banana', 'cushion', 'groucho']],
+  ];
+  const MORPH = {
+    eye: 'mochi', shade: 'ghostie', hand: 'egg',
+    mochi: 'flesh', egg: 'lipflower', chick: 'worm', ghostie: 'flesh',
+    flesh: 'groucho', worm: 'banana', lipflower: 'chicken',
+  };
+  const BG = [[255, 255, 255], [255, 246, 250], [247, 246, 236], [255, 255, 255]];
+  const PASTELS = ['#ffc8dd', '#c8f1dc', '#ddd2ff', '#fff0b3', '#c9e6ff'];
+  const CONFETTI = ['#ff4d6d', '#ffd23f', '#3ec1d3', '#7bd389', '#a36bff', '#ff9f1c'];
+  const IRISES = ['#3b6e8f', '#5a3d1e', '#4f7a3a', '#7a1c1c', '#2a2a2a', '#8a6d1d'];
+  const REDUCED = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // ---------- small utilities ----------
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const pick = arr => arr[(Math.random() * arr.length) | 0];
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const easeOut = t => 1 - Math.pow(1 - t, 3);
+  const easeOutBack = t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2);
+  const lerpAngle = (a, b, t) => a + ((((b - a + Math.PI) % TAU) + TAU) % TAU - Math.PI) * Math.min(1, t);
+  const hexRgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+  const mixHex = (a, b, t) => {
+    const pa = hexRgb(a), pb = hexRgb(b);
+    return `rgb(${pa.map((v, i) => Math.round(lerp(v, pb[i], t))).join(',')})`;
+  };
+
+  // ---------- canvas ----------
+  const canvas = document.getElementById('stage');
+  const ctx = canvas.getContext('2d');
+  let W = 0, H = 0;
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  // ---------- state ----------
+  const game = {
+    era: 0, progress: 0, time: 0, started: false,
+    entities: [], particles: [],
+    transition: null, finale: null,
+    pointer: { x: -1, y: -1 },
+    bg: [255, 255, 255],
+    quake: 0, dark: 0, flicker: 0, flickPos: { x: 0, y: 0 }, peek: null,
+    inflate: 0, bop: 0, beatTimer: 0, beatCount: 0, heartTimer: 1,
+  };
+  const button = { x: 0, y: 0, r: BUTTON_R, press: 0, home: 0 };
+  const drags = new Map();
+  const eraT = () => clamp(game.progress / ERA_LENGTH, 0, 1);
+
+  // ---------- sound (all synthesized) ----------
+  const audio = {
+    ctx: null, out: null, noise: null, drone: null,
+    get ready() { return !!this.ctx && this.ctx.state === 'running'; },
+    unlock() {
+      if (!this.ctx) this.init();
+      if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume().catch(() => { /* retried on next touch */ });
+    },
+    init() {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      const c = new AC();
+      this.ctx = c;
+      this.out = c.createGain(); this.out.gain.value = 0.55;
+      const comp = c.createDynamicsCompressor();
+      this.out.connect(comp); comp.connect(c.destination);
+      const buf = c.createBuffer(1, c.sampleRate, c.sampleRate), d = buf.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+      this.noise = buf;
+      const g = c.createGain(), f = c.createBiquadFilter();
+      g.gain.value = 0; f.type = 'lowpass'; f.frequency.value = 260;
+      [55, 55.7, 82.4].forEach(fr => { const o = c.createOscillator(); o.type = 'sawtooth'; o.frequency.value = fr; o.connect(f); o.start(); });
+      f.connect(g); g.connect(this.out);
+      this.drone = g;
+    },
+    setDrone(v) { if (this.drone) this.drone.gain.setTargetAtTime(v, this.ctx.currentTime, 0.4); },
+    tone(freq, dur, o = {}) {
+      if (!this.ready) return;
+      const c = this.ctx, t = c.currentTime + (o.delay || 0);
+      const osc = c.createOscillator(), g = c.createGain();
+      osc.type = o.type || 'sine';
+      osc.frequency.setValueAtTime(freq, t);
+      if (o.to) osc.frequency.exponentialRampToValueAtTime(o.to, t + (o.toAt || dur));
+      if (o.vib) {
+        const l = c.createOscillator(), lg = c.createGain();
+        l.frequency.value = o.vib[0]; lg.gain.value = o.vib[1];
+        l.connect(lg); lg.connect(osc.frequency); l.start(t); l.stop(t + dur + 0.05);
+      }
+      const vol = o.vol ?? 0.2;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(vol, t + (o.attack || 0.008));
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      let node = osc;
+      if (o.bp || o.lp) {
+        const f = c.createBiquadFilter();
+        f.type = o.bp ? 'bandpass' : 'lowpass'; f.frequency.value = o.bp || o.lp; f.Q.value = o.q || 1;
+        osc.connect(f); node = f;
+      }
+      node.connect(g); g.connect(this.out);
+      osc.start(t); osc.stop(t + dur + 0.05);
+    },
+    hiss(dur, o = {}) {
+      if (!this.ready) return;
+      const c = this.ctx, t = c.currentTime + (o.delay || 0);
+      const src = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+      src.buffer = this.noise;
+      f.type = o.type || 'bandpass'; f.frequency.setValueAtTime(o.f || 1000, t); f.Q.value = o.q ?? 1;
+      if (o.to) f.frequency.exponentialRampToValueAtTime(o.to, t + dur);
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(o.vol ?? 0.2, t + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      src.connect(f); f.connect(g); g.connect(this.out);
+      src.start(t, Math.random() * 0.4); src.stop(t + dur + 0.05);
+    },
+  };
+
+  const sfx = {
+    click: () => { audio.hiss(0.06, { f: 1800, vol: 0.25 }); audio.tone(90, 0.12, { vol: 0.3 }); },
+    blink: () => audio.tone(1400, 0.04, { vol: 0.05, type: 'triangle' }),
+    thump: (v = 0.35) => audio.tone(60, 0.18, { to: 40, vol: v }),
+    heartbeat: v => { sfx.thump(v); audio.tone(55, 0.16, { to: 38, vol: v * 0.8, delay: 0.18 }); },
+    stinger: (v = 0.25) => {
+      audio.hiss(0.5, { f: 1400, q: 0.7, vol: v, to: 300 });
+      [311, 330, 370, 392].forEach(f => audio.tone(f, 0.9, { type: 'sawtooth', vol: v * 0.25, lp: 1800, vib: [7, 6] }));
+    },
+    whoosh: () => audio.hiss(0.4, { f: 400, to: 2400, vol: 0.12, q: 0.6 }),
+    boop: () => audio.tone(520, 0.14, { to: 880, vol: 0.22 }),
+    pop: () => audio.tone(380, 0.09, { to: 1300, vol: 0.2 }),
+    giggle: () => { for (let i = 0; i < 5; i++) audio.tone(rand(800, 1150) + i * 60, 0.07, { vol: 0.12, delay: i * 0.075, type: 'triangle' }); },
+    cheep: () => { audio.tone(2300, 0.08, { to: 3100, vol: 0.1 }); audio.tone(2400, 0.09, { to: 3300, vol: 0.1, delay: 0.12 }); },
+    crack: () => audio.hiss(0.07, { type: 'highpass', f: 2500, vol: 0.25 }),
+    boo: () => audio.tone(330, 0.5, { to: 520, toAt: 0.25, vol: 0.15, vib: [6, 10] }),
+    twinkle: () => audio.tone(pick([1318, 1568, 1760, 2093]), 0.3, { vol: 0.05, type: 'triangle' }),
+    squelch: () => { audio.hiss(0.3, { type: 'lowpass', f: 1600, to: 180, vol: 0.35 }); audio.tone(140, 0.25, { to: 55, vol: 0.25, type: 'triangle' }); },
+    chatter: () => { for (let i = 0; i < 7; i++) audio.hiss(0.03, { f: 3200, q: 4, vol: 0.25, delay: i * 0.045 }); },
+    musicbox: () => audio.tone(pick([523, 587, 659, 784, 880]) * pick([1, 0.97, 1.04]), 0.9, { vol: 0.06, type: 'triangle', vib: [4, 8] }),
+    honk: () => {
+      audio.tone(250, 0.28, { to: 225, type: 'sawtooth', bp: 800, q: 3, vol: 0.5 });
+      audio.tone(256, 0.28, { to: 230, type: 'square', bp: 1100, q: 3, vol: 0.3 });
+    },
+    squawk: (delay = 0) => audio.tone(700, 0.42, { to: 1500, toAt: 0.12, type: 'sawtooth', bp: 1400, q: 2.5, vol: 0.35, vib: [28, 90], delay }),
+    squeak: () => audio.tone(1500, 0.18, { to: 2300, vol: 0.15 }),
+    fart: (delay = 0) => audio.tone(95, 0.6, { to: 60, type: 'sawtooth', lp: 500, vol: 0.5, vib: [23, 30], delay }),
+    slideUp: () => audio.tone(400, 0.5, { to: 1800, vol: 0.18 }),
+    slideDown: () => audio.tone(1800, 0.8, { to: 200, vol: 0.18 }),
+    boing: () => audio.tone(180, 0.45, { to: 420, type: 'triangle', vol: 0.3, vib: [18, 60] }),
+    kazoo: (n, delay = 0) => audio.tone(n, 0.2, { type: 'sawtooth', bp: 1300, q: 1.5, vol: 0.18, vib: [6, 8], delay }),
+    kick: () => audio.tone(120, 0.15, { to: 45, vol: 0.35 }),
+    bass: f => audio.tone(f, 0.18, { type: 'triangle', vol: 0.22 }),
+  };
+  const PRESS_SOUNDS = [sfx.click, sfx.boop, sfx.squelch, sfx.honk];
+
+  // ---------- drawing helpers ----------
+  function ellipse(x, y, rx, ry, fill, stroke, lw = 2.5) {
+    ctx.beginPath();
+    ctx.ellipse(x, y, Math.max(0.1, Math.abs(rx)), Math.max(0.1, Math.abs(ry)), 0, 0, TAU);
+    if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+    if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw; ctx.stroke(); }
+  }
+  function line(points, stroke, lw) {
+    ctx.beginPath(); ctx.moveTo(points[0], points[1]);
+    for (let i = 2; i < points.length; i += 2) ctx.lineTo(points[i], points[i + 1]);
+    ctx.strokeStyle = stroke; ctx.lineWidth = lw; ctx.stroke();
+  }
+  // unit-ish vector in the entity's local frame pointing at the last touch
+  function lookDir(x, y, rot) {
+    const has = game.pointer.x >= 0;
+    const dx = (has ? game.pointer.x : button.x) - x, dy = (has ? game.pointer.y : button.y) - y;
+    const d = Math.hypot(dx, dy) || 1, k = Math.min(1, d / 80);
+    const c = Math.cos(-rot), s = Math.sin(-rot);
+    return { x: ((dx * c - dy * s) / d) * k, y: ((dx * s + dy * c) / d) * k };
+  }
+  function tickBlink(s, dt, minGap = 1.5, maxGap = 5) {
+    s.nextBlink = (s.nextBlink ?? rand(minGap, maxGap)) - dt;
+    if (s.nextBlink < 0) { s.blinkT = 0.18; s.nextBlink = rand(minGap, maxGap); }
+    if (s.blinkT > 0) { s.blinkT -= dt; s.blink = Math.sin(clamp(1 - s.blinkT / 0.18, 0, 1) * Math.PI); }
+    else s.blink = 0;
+  }
+  function drawEyeball(x, y, r, look, o = {}) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(1, Math.max(0.06, 1 - (o.blink || 0)));
+    const g = ctx.createRadialGradient(-r * 0.3, -r * 0.3, r * 0.1, 0, 0, r);
+    g.addColorStop(0, '#ffffff'); g.addColorStop(1, '#ead9d3');
+    ellipse(0, 0, r, r, g);
+    if (o.veins) {
+      ctx.strokeStyle = 'rgba(175,25,35,0.55)'; ctx.lineWidth = Math.max(0.6, r * 0.035);
+      for (let i = 0; i < o.veins; i++) {
+        const a = (o.seed || 0) * 50 + i * 2.39;
+        ctx.beginPath();
+        ctx.moveTo(Math.cos(a) * r, Math.sin(a) * r);
+        ctx.quadraticCurveTo(Math.cos(a + 0.35) * r * 0.75, Math.sin(a + 0.35) * r * 0.75, Math.cos(a - 0.1) * r * 0.52, Math.sin(a - 0.1) * r * 0.52);
+        ctx.stroke();
+      }
+    }
+    const ix = look.x * r * 0.38, iy = look.y * r * 0.38, dil = o.dilate || 1;
+    ellipse(ix, iy, r * 0.44, r * 0.44, o.iris || '#4a0d0d');
+    ellipse(ix, iy, r * 0.2 * dil, r * 0.2 * dil, '#0b0606');
+    ellipse(ix - r * 0.14, iy - r * 0.16, r * 0.09, r * 0.09, 'rgba(255,255,255,0.9)');
+    ellipse(0, 0, r, r, null, OUTLINE, Math.max(1.4, r * 0.07));
+    ctx.restore();
+  }
+  function drawCuteFace(r, cx, cy, s, o = {}) {
+    const ex = r * (o.spread ?? 0.32), es = r * (o.eye ?? 0.08), lw = Math.max(1.6, r * 0.07);
+    ctx.lineCap = 'round';
+    for (const side of [-1, 1]) {
+      const x = cx + side * ex;
+      ctx.strokeStyle = OUTLINE; ctx.lineWidth = lw;
+      if (s.dizzy > 0) {
+        ctx.beginPath();
+        for (let a = 0; a < TAU * 2; a += 0.4) {
+          const rr = (es * 1.4 * a) / (TAU * 2), aa = a + game.time * 9 * side;
+          const px = x + Math.cos(aa) * rr, py = cy + Math.sin(aa) * rr;
+          if (a === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+        }
+        ctx.lineWidth = Math.max(1.2, r * 0.04); ctx.stroke();
+      } else if (s.happy > 0) {
+        ctx.beginPath(); ctx.arc(x, cy + es * 0.5, es, Math.PI * 1.15, Math.PI * 1.85); ctx.stroke();
+      } else {
+        const open = Math.max(0.12, 1 - (s.blink || 0));
+        ellipse(x, cy, es * 0.8, es * open, OUTLINE);
+        if (open > 0.5) ellipse(x - es * 0.25, cy - es * 0.4, es * 0.25, es * 0.25, '#ffffff');
+      }
+      ellipse(x + side * es * 0.6, cy + es * 2.1, es * 1.7, es * 0.9, 'rgba(255,110,150,0.45)');
+    }
+    if (o.mouth === false) return;
+    ctx.beginPath();
+    ctx.moveTo(cx - es * 1.2, cy + es * 1.4);
+    ctx.quadraticCurveTo(cx - es * 0.6, cy + es * 2.2, cx, cy + es * 1.5);
+    ctx.quadraticCurveTo(cx + es * 0.6, cy + es * 2.2, cx + es * 1.2, cy + es * 1.4);
+    ctx.lineWidth = Math.max(1.2, r * 0.045); ctx.strokeStyle = OUTLINE; ctx.stroke();
+  }
+  function drawMustache(x, y, w) {
+    ctx.fillStyle = '#1d1416';
+    ctx.beginPath();
+    ctx.moveTo(x, y - w * 0.12);
+    ctx.bezierCurveTo(x - w * 0.35, y - w * 0.35, x - w * 0.9, y - w * 0.1, x - w, y + w * 0.15);
+    ctx.bezierCurveTo(x - w * 0.6, y + w * 0.05, x - w * 0.3, y + w * 0.25, x, y + w * 0.08);
+    ctx.bezierCurveTo(x + w * 0.3, y + w * 0.25, x + w * 0.6, y + w * 0.05, x + w, y + w * 0.15);
+    ctx.bezierCurveTo(x + w * 0.9, y - w * 0.1, x + w * 0.35, y - w * 0.35, x, y - w * 0.12);
+    ctx.fill();
+  }
+  function drawLips(w, open) {
+    const h = w * 0.55;
+    ctx.fillStyle = '#d94a64'; ctx.strokeStyle = '#6e1a2a'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(-w, 0);
+    ctx.bezierCurveTo(-w * 0.6, -h * 1.1, -w * 0.15, -h * 0.9, 0, -h * 0.55);
+    ctx.bezierCurveTo(w * 0.15, -h * 0.9, w * 0.6, -h * 1.1, w, 0);
+    ctx.bezierCurveTo(w * 0.6, h * 1.2, -w * 0.6, h * 1.2, -w, 0);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    if (open > 0.15) { ellipse(0, 0, w * 0.6, h * 0.4 * open, '#3d0b10'); return; }
+    ctx.beginPath(); ctx.moveTo(-w * 0.85, 0); ctx.quadraticCurveTo(0, h * 0.25, w * 0.85, 0); ctx.stroke();
+  }
+  function drawShades(x, y, s) {
+    ellipse(x - s * 1.05, y, s, s * 0.62, '#141014');
+    ellipse(x + s * 1.05, y, s, s * 0.62, '#141014');
+    line([x - s * 0.2, y - s * 0.2, x + s * 0.2, y - s * 0.2], '#141014', Math.max(1.5, s * 0.25));
+    ellipse(x - s * 1.3, y - s * 0.2, s * 0.25, s * 0.14, 'rgba(255,255,255,0.6)');
+  }
+  function bananaPath(r) {
+    ctx.beginPath();
+    ctx.moveTo(-r * 0.9, -r * 0.5);
+    ctx.quadraticCurveTo(0, r * 1.25, r * 0.9, -r * 0.5);
+    ctx.quadraticCurveTo(0, r * 0.3, -r * 0.9, -r * 0.5);
+    ctx.closePath();
+  }
+
+  // googly eyes: pupils are little weights that slosh when the owner moves
+  const mkGoogly = (x, y, R) => ({ x, y, R, px: 0, py: 0, vx: 0, vy: 0 });
+  function tickGoogly(e, dt) {
+    for (const g of e.state.googly) {
+      const max = g.R * e.r * 0.45;
+      g.vx -= (e.vx - e.lvx) * 0.9; g.vy -= (e.vy - e.lvy) * 0.9;
+      g.vy += 1500 * dt;
+      g.vx *= 1 - Math.min(1, dt * 1.2); g.vy *= 1 - Math.min(1, dt * 1.2);
+      g.px += g.vx * dt; g.py += g.vy * dt;
+      const d = Math.hypot(g.px, g.py);
+      if (d <= max) continue;
+      const nx = g.px / d, ny = g.py / d, vn = g.vx * nx + g.vy * ny;
+      g.px = nx * max; g.py = ny * max;
+      if (vn > 0) { g.vx -= vn * nx * 1.6; g.vy -= vn * ny * 1.6; }
+      g.vx *= 0.96; g.vy *= 0.96;
+    }
+  }
+  function drawGoogly(e, g, oy = 0) {
+    const R = g.R * e.r, X = g.x * e.r, Y = g.y * e.r + oy;
+    const c = Math.cos(-e.rot), s = Math.sin(-e.rot);
+    ellipse(X, Y, R, R, '#ffffff', OUTLINE, 2.5);
+    ellipse(X + g.px * c - g.py * s, Y + g.px * s + g.py * c, R * 0.52, R * 0.52, '#141014');
+  }
+
+  // ---------- entity helpers ----------
+  function makeEntity(kind, x, y, extra = {}) {
+    const k = KINDS[kind];
+    return {
+      kind, x, y, vx: 0, vy: 0, lvx: 0, lvy: 0,
+      r: k.r * rand(0.88, 1.12), rot: 0, vr: 0, sq: 0, sqv: 0,
+      age: 0, seed: Math.random(), fade: 1,
+      dying: false, dead: false, dragging: false, onFloor: false,
+      state: k.init ? k.init() : {},
+      ...extra,
+    };
+  }
+  function addEntity(e) {
+    game.entities.push(e);
+    const alive = game.entities.filter(o => !o.dying);
+    if (alive.length > MAX_ENTITIES) {
+      const oldest = alive.find(o => !o.dragging);
+      if (oldest) oldest.dying = true;
+    }
+    return e;
+  }
+  function replaceEntity(old, next) {
+    const i = game.entities.indexOf(old);
+    if (i < 0) return;
+    next.vx = old.vx; next.vy = old.vy; next.dragging = old.dragging;
+    game.entities[i] = next;
+    for (const d of drags.values()) if (d.e === old) d.e = next;
+  }
+  function fling(e, speed) {
+    const a = rand(0, TAU);
+    e.vx += Math.cos(a) * speed; e.vy += Math.sin(a) * speed - speed * 0.3;
+  }
+  function spawnChild(parent, kind, scale, speed = 260) {
+    const c = makeEntity(kind, parent.x, parent.y, { r: parent.r * scale });
+    fling(c, speed);
+    return addEntity(c);
+  }
+  function hopper(e, dt, minGap, maxGap, power) {
+    const s = e.state;
+    s.hop = (s.hop ?? rand(minGap, maxGap)) - dt;
+    if (!e.onFloor || s.hop > 0 || e.dragging) return;
+    e.vy = -rand(power * 0.7, power); e.vx += rand(-140, 140); e.sqv += 5;
+    s.hop = rand(minGap, maxGap);
+  }
+  function burst(type, x, y, n, o = {}) { for (let i = 0; i < n; i++) spawnParticle(type, x, y, o); }
+
+  // ---------- creatures ----------
+  // each kind: base radius, physics knobs, init() state, update(e, dt), draw(e) in local space, tap(e), shake(e)
+  const KINDS = {};
+
+  // ===== era 0: scary =====
+  KINDS.eye = {
+    r: 30, wander: 40, drag: 1.4,
+    init: () => ({ roll: 0, dilate: 1 }),
+    update(e, dt) {
+      const s = e.state;
+      tickBlink(s, dt);
+      s.roll = Math.max(0, s.roll - dt);
+      s.dilate = lerp(s.dilate, s.roll > 0 ? 1.9 : 1, Math.min(1, dt * 4));
+      if (s.roll > 0 && Math.random() < dt * 10) spawnParticle('drop', e.x + rand(-e.r * 0.3, e.r * 0.3), e.y + e.r * 0.6, { vx: 0, vy: rand(20, 80) });
+    },
+    draw(e) {
+      const s = e.state;
+      const look = s.roll > 0 ? { x: Math.cos(game.time * 14), y: Math.sin(game.time * 14) } : lookDir(e.x, e.y, e.rot);
+      drawEyeball(0, 0, e.r, look, { blink: s.blink, veins: 4 + Math.round(eraT() * 6), dilate: s.dilate, seed: e.seed });
+    },
+    tap(e) {
+      e.state.blinkT = 0.18; sfx.blink();
+      if (e.r < 15) { e.vr += rand(-6, 6); return; }
+      e.r *= 0.82; spawnChild(e, 'eye', 1, 260); fling(e, 120);
+    },
+    shake(e) { e.state.roll = 1.4; sfx.stinger(0.14); game.quake = 6; },
+  };
+
+  KINDS.shade = {
+    r: 40, wander: 22, drag: 1.6,
+    init: () => ({ mouth: 0, flick: 0, next: rand(2, 5) }),
+    update(e, dt) {
+      const s = e.state;
+      s.mouth = Math.max(0, s.mouth - dt * 0.9);
+      s.flick = Math.max(0, s.flick - dt);
+      s.next -= dt;
+      if (s.next > 0) return;
+      s.next = rand(2.5, 6); s.flick = 0.25;
+      if (!e.dragging) { e.x = clamp(e.x + rand(-90, 90), e.r, W - e.r); e.y = clamp(e.y + rand(-90, 90), e.r, H - e.r); }
+    },
+    draw(e) {
+      const s = e.state, r = e.r;
+      if (s.flick > 0 && Math.random() < 0.5) return;
+      if (s.flick > 0) ctx.translate(rand(-4, 4), 0);
+      ctx.fillStyle = '#0d0b0c';
+      ctx.beginPath();
+      ctx.moveTo(-r * 0.22, -r * 0.3);
+      ctx.quadraticCurveTo(-r * 0.95, r * 0.35, -r * 0.75, r);
+      for (let i = 1; i <= 8; i++) {
+        const y = r * (i % 2 ? 0.86 : 1) + Math.sin(game.time * 5 + i + e.seed * 9) * r * 0.06;
+        ctx.lineTo(-r * 0.75 + (r * 1.5 * i) / 8, y);
+      }
+      ctx.quadraticCurveTo(r * 0.95, r * 0.35, r * 0.22, -r * 0.3);
+      ctx.closePath(); ctx.fill();
+      ellipse(0, -r * 0.55, r * 0.4, r * 0.47, '#0d0b0c');
+      const look = lookDir(e.x, e.y, e.rot), eye = s.mouth > 0 ? '#ff2b2b' : '#ffffff';
+      for (const side of [-1, 1]) ellipse(side * r * 0.15 + look.x * r * 0.05, -r * 0.62 + look.y * r * 0.04, r * 0.075, r * 0.05, eye);
+      if (s.mouth <= 0) return;
+      const my = -r * 0.36, mw = r * 0.2, mh = r * 0.22 * Math.min(1, s.mouth * 1.5);
+      ellipse(0, my, mw, mh, '#4a0006');
+      ctx.fillStyle = '#f4efe6';
+      for (let i = 0; i < 5; i++) {
+        const x = -mw * 0.8 + (mw * 1.6 * i) / 4;
+        for (const dir of [-1, 1]) {
+          ctx.beginPath();
+          ctx.moveTo(x - mw * 0.16, my + dir * mh * 0.85); ctx.lineTo(x + mw * 0.16, my + dir * mh * 0.85); ctx.lineTo(x, my + dir * mh * 0.2);
+          ctx.fill();
+        }
+      }
+    },
+    tap(e) {
+      sfx.whoosh(); burst('smoke', e.x, e.y, 6);
+      const h = makeEntity('hand', e.x, e.y + e.r * 0.5); fling(h, 200); addEntity(h);
+      e.x = rand(e.r, W - e.r); e.y = rand(e.r, H * 0.6); e.state.flick = 0.4;
+    },
+    shake(e) {
+      e.state.mouth = 1.6; game.dark = 0.8; game.quake = 10; sfx.stinger(0.3);
+      for (let i = 0; i < 2; i++) spawnChild(e, 'eye', 0.6, 300);
+    },
+  };
+
+  KINDS.hand = {
+    r: 32, drag: 2.4,
+    init: () => ({ fingers: 5, clench: 0, palmEye: false, crawl: rand(0, 6), heading: rand(0, TAU) }),
+    update(e, dt) {
+      const s = e.state;
+      s.clench = Math.max(0, s.clench - dt * 1.2);
+      if (e.dragging) return;
+      s.crawl += dt * 7;
+      s.heading += Math.sin(game.time * 0.8 + e.seed * 30) * dt;
+      const m = e.r * 1.5;
+      if (e.x < m || e.x > W - m || e.y < m || e.y > H - m) s.heading = Math.atan2(H / 2 - e.y, W / 2 - e.x);
+      if (Math.sin(s.crawl) > 0.5) { e.vx += Math.cos(s.heading) * 520 * dt; e.vy += Math.sin(s.heading) * 520 * dt; }
+      e.rot = lerpAngle(e.rot, s.heading + Math.PI / 2, dt * 4);
+    },
+    draw(e) {
+      const s = e.state, r = e.r, n = s.fingers;
+      for (let i = 0; i < n; i++) {
+        const a = -Math.PI / 2 - 0.95 + (1.9 * i) / (n - 1);
+        const bend = (0.5 + 0.5 * Math.sin(s.crawl + i * 1.3)) * 0.9 + s.clench * 1.6;
+        const len = r * (0.55 + 0.25 * Math.sin(i * 2.1 + e.seed * 7) + (i === 0 || i === n - 1 ? -0.1 : 0.15));
+        const bx = Math.cos(a) * r * 0.42, by = Math.sin(a) * r * 0.42;
+        const kx = bx + Math.cos(a) * len * 0.55, ky = by + Math.sin(a) * len * 0.55;
+        line([bx, by, kx, ky, kx + Math.cos(a + bend) * len * 0.5, ky + Math.sin(a + bend) * len * 0.5], '#0d0b0c', r * 0.17);
+      }
+      ellipse(0, r * 0.05, r * 0.5, r * 0.55, '#0d0b0c');
+      if (s.palmEye) drawEyeball(0, r * 0.08, r * 0.26 * (1 - s.clench * 0.8), lookDir(e.x, e.y, e.rot), { veins: 3, seed: e.seed });
+    },
+    tap(e) {
+      const s = e.state;
+      s.clench = 1; sfx.thump(0.3);
+      if (!s.palmEye) s.palmEye = true; else spawnChild(e, 'eye', 0.7, 240);
+    },
+    shake(e) {
+      e.state.fingers = Math.min(11, e.state.fingers + 2);
+      sfx.crack(); sfx.stinger(0.12); burst('smoke', e.x, e.y, 4);
+    },
+  };
+
+  // ===== era 1: cute =====
+  KINDS.mochi = {
+    r: 30, gravity: 1100, drag: 0.6, bounce: 0.5, foot: 0.62, upright: true,
+    init: () => ({ color: pick(PASTELS), happy: 0, dizzy: 0, glitch: 0 }),
+    update(e, dt) {
+      const s = e.state;
+      s.happy -= dt; s.dizzy -= dt; s.glitch -= dt;
+      tickBlink(s, dt);
+      hopper(e, dt, 1.4, 4, 560);
+      // late in the cute era something starts to look back
+      if (game.era === 1 && eraT() > 0.65 && Math.random() < dt * 0.12) s.glitch = 0.7;
+    },
+    draw(e) {
+      const s = e.state, r = e.r;
+      ctx.beginPath();
+      ctx.moveTo(-r, r * 0.55);
+      ctx.bezierCurveTo(-r * 1.1, -r * 0.95, r * 1.1, -r * 0.95, r, r * 0.55);
+      ctx.quadraticCurveTo(0, r * 0.78, -r, r * 0.55);
+      ctx.fillStyle = s.color; ctx.fill();
+      ctx.strokeStyle = OUTLINE; ctx.lineWidth = 2.5; ctx.stroke();
+      ellipse(-r * 0.45, -r * 0.22, r * 0.16, r * 0.09, 'rgba(255,255,255,0.7)');
+      drawCuteFace(r, 0, r * 0.08, s);
+      if (s.glitch > 0) drawEyeball(0, -r * 0.3, r * 0.17, lookDir(e.x, e.y, e.rot), { veins: 2, iris: '#2f5d3a' });
+    },
+    tap(e) {
+      e.state.happy = 0.9; e.sqv += 7; sfx.giggle();
+      burst('heart', e.x, e.y - e.r * 0.5, 2, { vy: -160 });
+      if (e.r > 16) spawnChild(e, 'mochi', 0.62, 200).vy = -480;
+    },
+    shake(e) { e.state.dizzy = 1.6; sfx.boing(); burst('heart', e.x, e.y, 4); burst('star', e.x, e.y, 4); },
+  };
+
+  KINDS.egg = {
+    r: 28, gravity: 1100, drag: 0.8, bounce: 0.35, foot: 0.75,
+    init: () => ({ cracks: 0, wob: 0 }),
+    update(e, dt) {
+      const s = e.state;
+      s.wob *= Math.pow(0.08, dt);
+      if (Math.random() < dt * 0.35) s.wob = Math.max(s.wob, 0.4);
+      if (!e.dragging) e.rot = Math.sin(game.time * 16) * s.wob * 0.35;
+    },
+    draw(e) {
+      const s = e.state, r = e.r;
+      ctx.beginPath();
+      ctx.moveTo(0, -r * 1.05);
+      ctx.bezierCurveTo(r * 0.85, -r, r * 0.85, r * 0.75, 0, r * 0.75);
+      ctx.bezierCurveTo(-r * 0.85, r * 0.75, -r * 0.85, -r, 0, -r * 1.05);
+      ctx.fillStyle = '#fff8ea'; ctx.fill(); ctx.strokeStyle = OUTLINE; ctx.lineWidth = 2.5; ctx.stroke();
+      ellipse(r * 0.2, -r * 0.5, r * 0.08, r * 0.06, '#f3d7b6');
+      ellipse(-r * 0.25, r * 0.3, r * 0.1, r * 0.07, '#f3d7b6');
+      for (let i = 0; i < Math.min(3, s.cracks); i++) {
+        const y = -r * 0.32 + i * r * 0.3, pts = [];
+        for (let j = 0; j <= 6; j++) pts.push(-r * 0.55 + j * r * 0.18, y + (j % 2 ? -r * 0.08 : r * 0.05));
+        line(pts, OUTLINE, 2);
+      }
+      if (s.cracks >= 2) for (const side of [-1, 1]) ellipse(side * r * 0.15, -r * 0.16, r * 0.05, r * 0.06, OUTLINE);
+    },
+    tap(e) { const s = e.state; s.cracks++; s.wob = 1; e.sqv += 4; sfx.crack(); if (s.cracks >= 3) hatch(e); },
+    shake(e) { const s = e.state; s.cracks += 2; s.wob = 1.5; sfx.crack(); if (s.cracks >= 3) hatch(e); },
+  };
+  function hatch(e) {
+    replaceEntity(e, makeEntity('chick', e.x, e.y, { r: e.r }));
+    burst('shell', e.x, e.y, 8); sfx.cheep(); sfx.pop();
+  }
+
+  KINDS.chick = {
+    r: 26, gravity: 1100, drag: 0.7, bounce: 0.45, foot: 0.95, upright: true,
+    init: () => ({ beak: 0, flap: 0, hat: true }),
+    update(e, dt) {
+      const s = e.state;
+      s.beak = Math.max(0, s.beak - dt); s.flap = Math.max(0, s.flap - dt);
+      tickBlink(s, dt);
+      hopper(e, dt, 0.8, 2.6, 420);
+    },
+    draw(e) {
+      const s = e.state, r = e.r;
+      const fl = Math.sin(game.time * (s.flap > 0 ? 40 : 6)) * (s.flap > 0 ? 0.8 : 0.2);
+      for (const side of [-1, 1]) line([side * r * 0.3, r * 0.8, side * r * 0.3, r], '#e88a12', 2.5);
+      for (const side of [-1, 1]) {
+        ctx.save(); ctx.translate(side * r * 0.85, r * 0.15); ctx.rotate(side * (0.4 + fl));
+        ellipse(0, 0, r * 0.28, r * 0.16, '#ffd43b', OUTLINE, 2);
+        ctx.restore();
+      }
+      ellipse(0, 0, r * 0.9, r * 0.88, '#ffe066', OUTLINE, 2.5);
+      drawCuteFace(r, 0, -r * 0.12, s, { spread: 0.34, mouth: false });
+      const y0 = r * 0.02, bo = s.beak > 0 ? r * 0.12 : 0;
+      ctx.fillStyle = '#ff9f1c'; ctx.strokeStyle = OUTLINE; ctx.lineWidth = 1.8;
+      ctx.beginPath(); ctx.moveTo(-r * 0.1, y0 + r * 0.08 + bo); ctx.lineTo(r * 0.1, y0 + r * 0.08 + bo); ctx.lineTo(0, y0 + r * 0.2 + bo); ctx.closePath(); ctx.fill(); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(-r * 0.14, y0); ctx.lineTo(r * 0.14, y0); ctx.lineTo(0, y0 + r * 0.14); ctx.closePath(); ctx.fill(); ctx.stroke();
+      if (!s.hat) return;
+      ctx.beginPath();
+      ctx.ellipse(0, -r * 0.62, r * 0.5, r * 0.34, 0, Math.PI, TAU);
+      for (let i = 0; i <= 6; i++) ctx.lineTo(r * 0.5 - (r * i) / 6, -r * 0.62 + (i % 2 ? r * 0.12 : 0));
+      ctx.closePath(); ctx.fillStyle = '#fff8ea'; ctx.fill(); ctx.strokeStyle = OUTLINE; ctx.lineWidth = 2; ctx.stroke();
+    },
+    tap(e) {
+      const s = e.state;
+      s.beak = 0.35; sfx.cheep();
+      if (e.onFloor) e.vy = -480;
+      if (s.hat && Math.random() < 0.4) { s.hat = false; burst('shell', e.x, e.y - e.r * 0.6, 3); }
+      spawnParticle('heart', e.x, e.y - e.r, { vy: -140 });
+    },
+    shake(e) {
+      e.state.flap = 1.4; sfx.cheep();
+      burst('feather', e.x, e.y, 8, { color: '#ffe066' });
+      if (e.r > 16) spawnChild(e, 'egg', 0.7, 240);
+    },
+  };
+
+  KINDS.ghostie = {
+    r: 32, wander: 30, drag: 1.2,
+    init: () => ({ tongue: 0 }),
+    update(e, dt) {
+      const s = e.state;
+      s.tongue = Math.max(0, s.tongue - dt);
+      tickBlink(s, dt);
+      if (!e.dragging) e.rot = Math.sin(game.time * 1.6 + e.seed * 9) * 0.12;
+    },
+    draw(e) {
+      const s = e.state, r = e.r, t = game.time * 4 + e.seed * 10;
+      for (const side of [-1, 1]) ellipse(side * r * 0.82, r * 0.15 + Math.sin(t + side) * r * 0.08, r * 0.2, r * 0.12, '#ffffff', OUTLINE, 2.2);
+      ctx.beginPath();
+      ctx.moveTo(-r * 0.75, r * 0.7);
+      ctx.lineTo(-r * 0.75, -r * 0.1);
+      ctx.arc(0, -r * 0.1, r * 0.75, Math.PI, 0);
+      ctx.lineTo(r * 0.75, r * 0.7);
+      for (let i = 0; i < 4; i++) {
+        const x0 = r * 0.75 - (r * 1.5 * i) / 4, x1 = r * 0.75 - (r * 1.5 * (i + 1)) / 4;
+        ctx.quadraticCurveTo((x0 + x1) / 2, r * (0.95 + Math.sin(t + i) * 0.1), x1, r * 0.7);
+      }
+      ctx.closePath(); ctx.fillStyle = '#ffffff'; ctx.fill(); ctx.strokeStyle = OUTLINE; ctx.lineWidth = 2.5; ctx.stroke();
+      drawCuteFace(r, 0, -r * 0.1, s, { mouth: false });
+      if (s.tongue > 0) {
+        ellipse(0, r * 0.2, r * 0.12, r * 0.1, '#5a2030');
+        ellipse(0, r * 0.3, r * 0.09, r * 0.1, '#ff7a9a', OUTLINE, 1.5);
+      } else ellipse(0, r * 0.18, r * 0.06, r * 0.07, OUTLINE);
+    },
+    tap(e) { e.state.tongue = 1; e.sqv += 5; sfx.boo(); burst('heart', e.x, e.y - e.r * 0.4, 3, { vy: -150 }); },
+    shake(e) {
+      sfx.pop(); burst('sparkle', e.x, e.y, 8);
+      if (e.r > 16) { e.r *= 0.78; spawnChild(e, 'ghostie', 1, 260); }
+    },
+  };
+
+  // ===== era 2: grotesque =====
+  const newFleshEye = () => ({ a: rand(0, TAU), d: rand(0.15, 0.55), s: rand(0.14, 0.3), iris: pick(IRISES) });
+  KINDS.flesh = {
+    r: 40, wander: 16, drag: 1.6, hit: 1,
+    init: () => ({ eyes: [newFleshEye(), newFleshEye()], wob: 0, chomp: 0 }),
+    update(e, dt) {
+      const s = e.state;
+      s.wob *= Math.pow(0.15, dt);
+      s.chomp = Math.max(0, s.chomp - dt * 2);
+      for (const eye of s.eyes) tickBlink(eye, dt, 0.6, 4);
+    },
+    draw(e) {
+      const s = e.state, r = e.r, t = game.time, n = 28, pts = [];
+      for (let i = 0; i < n; i++) {
+        const a = (i / n) * TAU;
+        const rr = r * (1 + 0.1 * Math.sin(a * 3 + t * 1.7 + e.seed * 10) * (1 + s.wob) + 0.07 * Math.sin(a * 5 - t * 2.3) * (1 + s.wob * 2));
+        pts.push([Math.cos(a) * rr, Math.sin(a) * rr]);
+      }
+      ctx.beginPath();
+      for (let i = 0; i <= n; i++) {
+        const p = pts[i % n], q = pts[(i + 1) % n], mx = (p[0] + q[0]) / 2, my = (p[1] + q[1]) / 2;
+        if (i === 0) ctx.moveTo(mx, my); else ctx.quadraticCurveTo(p[0], p[1], mx, my);
+      }
+      ctx.closePath();
+      const g = ctx.createRadialGradient(-r * 0.3, -r * 0.35, r * 0.1, 0, 0, r * 1.15);
+      g.addColorStop(0, '#f4cdbd'); g.addColorStop(1, '#c27d6c');
+      ctx.fillStyle = g; ctx.fill(); ctx.strokeStyle = '#6b3b35'; ctx.lineWidth = 2.5; ctx.stroke();
+      for (let i = 0; i < 5; i++) {
+        const a = e.seed * 30 + i * 1.9, d = r * (0.3 + 0.4 * ((i * 0.37 + e.seed) % 1));
+        ellipse(Math.cos(a) * d, Math.sin(a) * d, r * 0.09, r * 0.06, 'rgba(130,50,55,0.22)');
+      }
+      const open = clamp(0.35 + 0.35 * Math.sin(t * 2.2 + e.seed * 7) + s.chomp * 0.6, 0.1, 1.2);
+      const mw = r * 0.42, mh = r * 0.22 * open, my = r * 0.42;
+      ellipse(0, my, mw, mh + 2, '#4a0f14', '#9c4a52', 3);
+      for (let i = 0; i < 5; i++) {
+        const x = -mw * 0.72 + (mw * 1.44 * i) / 4, tw = mw * 0.14, th = Math.max(2, mh * 0.5);
+        ellipse(x, my - mh + th * 0.5, tw, th * 0.5, '#fbf6ea', 'rgba(80,40,40,0.5)', 1);
+        ellipse(x, my + mh - th * 0.5, tw, th * 0.5, '#fbf6ea', 'rgba(80,40,40,0.5)', 1);
+      }
+      const look = lookDir(e.x, e.y, e.rot);
+      s.eyes.forEach((eye, i) => {
+        const x = Math.cos(eye.a) * eye.d * r, y = Math.min(r * 0.1, Math.sin(eye.a) * eye.d * r * 0.8 - r * 0.2);
+        drawEyeball(x, y, eye.s * r, look, { blink: eye.blink, veins: 3, iris: eye.iris, seed: e.seed + i });
+      });
+      // the grotesque era ends by growing a mustache
+      if (game.era === 2 && eraT() > 0.7) drawMustache(0, r * 0.2, r * 0.5);
+    },
+    tap(e) {
+      const s = e.state;
+      if (s.eyes.length < 9) s.eyes.push(newFleshEye());
+      s.chomp = 1; s.wob = 1; e.sqv += 6; sfx.squelch();
+      spawnParticle('tooth', e.x, e.y + e.r * 0.4, { vy: -rand(200, 380) });
+    },
+    shake(e) {
+      e.state.wob = 2.5; sfx.squelch();
+      spawnChild(e, 'worm', 0.75, 280);
+      burst('drop', e.x, e.y, 5, { color: '#a8505a' });
+    },
+  };
+
+  KINDS.worm = {
+    r: 22, drag: 1.4, hit: 1.6,
+    init: () => ({ seg: 7, heading: rand(0, TAU), curl: 0 }),
+    update(e, dt) {
+      const s = e.state;
+      s.curl = Math.max(0, s.curl - dt * 0.7);
+      if (e.dragging) {
+        if (Math.hypot(e.vx, e.vy) > 30) e.rot = lerpAngle(e.rot, Math.atan2(e.vy, e.vx), dt * 8);
+        return;
+      }
+      s.heading += Math.sin(game.time * 1.3 + e.seed * 20) * dt * 1.6;
+      const m = e.r * 2;
+      if (e.x < m || e.x > W - m || e.y < m || e.y > H - m) s.heading = lerpAngle(s.heading, Math.atan2(H / 2 - e.y, W / 2 - e.x), dt * 3);
+      const sp = 80 + s.curl * 120;
+      e.vx += (Math.cos(s.heading) * sp - e.vx) * dt * 2;
+      e.vy += (Math.sin(s.heading) * sp - e.vy) * dt * 2;
+      e.rot = lerpAngle(e.rot, Math.atan2(e.vy, e.vx), dt * 5);
+    },
+    draw(e) {
+      const s = e.state, r = e.r, t = game.time * (6 + s.curl * 8) + e.seed * 5, amp = r * (0.22 + s.curl * 0.4);
+      for (let i = s.seg; i >= 1; i--) {
+        const x = -i * r * 0.42, y = Math.sin(t - i * 0.9) * amp * Math.min(1, i / 2), rr = r * (0.36 - i * 0.012);
+        ellipse(x, y, rr, rr, '#e9b9a3', '#7a4a3c', 2);
+        ctx.strokeStyle = 'rgba(122,74,60,0.6)'; ctx.lineWidth = 1.2;
+        ctx.beginPath(); ctx.arc(x + rr * 0.3, y, rr * 0.7, -0.8, 0.8); ctx.stroke();
+      }
+      const hy = Math.sin(t) * amp * 0.3;
+      ellipse(r * 0.15, hy, r * 0.48, r * 0.36, '#ecbfa9', '#7a4a3c', 2.2);
+      ellipse(r * 0.34, hy, r * 0.22, r * 0.18, '#f8dcd5', '#b07a70', 1.6);
+      ctx.strokeStyle = 'rgba(122,74,60,0.6)'; ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.arc(-r * 0.12, hy, r * 0.25, -0.9, 0.9); ctx.stroke();
+    },
+    tap(e) {
+      const s = e.state;
+      sfx.squelch(); e.sqv += 5;
+      if (s.seg < 4) { s.curl = 1.5; return; }
+      const half = Math.floor(s.seg / 2);
+      s.seg -= half;
+      spawnChild(e, 'worm', 0.9, 220).state.seg = Math.max(3, half + 1);
+    },
+    shake(e) {
+      e.state.curl = 2; sfx.squelch();
+      burst('drop', e.x, e.y, 4, { color: '#a8505a' });
+      spawnParticle('eyelet', e.x + rand(-30, 30), e.y + rand(-30, 30), { vx: 0, vy: 0, life: 1.2, size: 10 });
+    },
+  };
+
+  KINDS.lipflower = {
+    r: 36, wander: 18, drag: 1.5,
+    init: () => ({ spin: rand(0.3, 0.7) * (Math.random() < 0.5 ? -1 : 1), chatter: 0, eyes: 0 }),
+    update(e, dt) {
+      const s = e.state;
+      s.chatter = Math.max(0, s.chatter - dt); s.eyes = Math.max(0, s.eyes - dt);
+      e.rot += s.spin * dt * (1 + s.chatter * 4);
+      tickBlink(s, dt, 0.4, 1.5);
+    },
+    draw(e) {
+      const s = e.state, r = e.r, n = 6;
+      for (let i = 0; i < n; i++) {
+        const a = (i / n) * TAU;
+        ctx.save(); ctx.rotate(a); ctx.translate(0, -r * 0.66);
+        if (s.eyes > 0) drawEyeball(0, 0, r * 0.26, lookDir(e.x, e.y, e.rot + a), { blink: s.blink, veins: 2, seed: i });
+        else drawLips(r * 0.34, s.chatter > 0 ? Math.abs(Math.sin(game.time * 30 + i)) : 0.1);
+        ctx.restore();
+      }
+      ellipse(0, 0, r * 0.4, r * 0.4, '#e9c7b5', '#6b3b35', 2.5);
+      const open = s.chatter > 0 ? 0.5 + 0.5 * Math.sin(game.time * 40) : 0.6;
+      ellipse(0, 0, r * 0.28, r * 0.28 * open, '#3d0b10');
+      for (let i = 0; i < 8; i++) {
+        const a = (i / 8) * TAU;
+        ellipse(Math.cos(a) * r * 0.24, Math.sin(a) * r * 0.24 * open, r * 0.05, r * 0.07, '#fbf6ea', 'rgba(80,40,40,0.5)', 1);
+      }
+    },
+    tap(e) {
+      e.state.chatter = 0.8; sfx.chatter();
+      for (let i = 0; i < 2; i++) spawnParticle('tooth', e.x, e.y, { vy: -rand(150, 320) });
+    },
+    shake(e) { e.state.eyes = 3; sfx.squelch(); e.sqv += 6; },
+  };
+
+  // ===== era 3: funny =====
+  KINDS.groucho = {
+    r: 36, wander: 20, drag: 1.3,
+    init: () => ({ honk: 0, pop: 0, brow: 0, spin: 0, googly: [mkGoogly(-0.34, -0.12, 0.25), mkGoogly(0.34, -0.12, 0.25)] }),
+    update(e, dt) {
+      const s = e.state;
+      s.honk = Math.max(0, s.honk - dt * 3); s.pop = Math.max(0, s.pop - dt * 2); s.brow = Math.max(0, s.brow - dt * 2);
+      if (s.spin > 0) { s.spin -= dt; e.rot += dt * 16 * s.spin; }
+      else if (!e.dragging) e.rot = lerpAngle(e.rot, Math.sin(game.time * 2 + e.seed * 6) * 0.15, dt * 3);
+      tickGoogly(e, dt);
+    },
+    draw(e) {
+      const s = e.state, r = e.r, py = -Math.sin(s.pop * Math.PI) * r * 0.3;
+      for (const side of [-1, 1]) ellipse(side * r * 0.92, 0, r * 0.14, r * 0.2, '#ffd2ad', OUTLINE, 2.2);
+      ellipse(0, 0, r * 0.9, r * 0.95, '#ffd9b8', OUTLINE, 2.5);
+      const by = -r * 0.48 + py - s.brow * r * 0.12 * Math.abs(Math.sin(game.time * 20));
+      ctx.strokeStyle = '#1d1416'; ctx.lineWidth = r * 0.12;
+      for (const side of [-1, 1]) {
+        ctx.beginPath(); ctx.moveTo(side * r * 0.55, by + r * 0.05);
+        ctx.quadraticCurveTo(side * r * 0.35, by - r * 0.1, side * r * 0.12, by + r * 0.02); ctx.stroke();
+      }
+      for (const g of s.googly) drawGoogly(e, g, py);
+      ctx.strokeStyle = '#1d1416'; ctx.lineWidth = r * 0.07;
+      for (const side of [-1, 1]) { ctx.beginPath(); ctx.arc(side * r * 0.34, -r * 0.12 + py, r * 0.3, 0, TAU); ctx.stroke(); }
+      line([-r * 0.06, -r * 0.16 + py, r * 0.06, -r * 0.16 + py], '#1d1416', r * 0.06);
+      const nr = r * 0.24;
+      ellipse(0, r * 0.18, nr * (1 + s.honk * 0.5), nr * (1 - s.honk * 0.35), '#ff8f9b', OUTLINE, 2.5);
+      ellipse(-nr * 0.3, r * 0.1, nr * 0.25, nr * 0.18, 'rgba(255,255,255,0.7)');
+      drawMustache(0, r * 0.48, r * 0.55);
+    },
+    tap(e) { const s = e.state; s.honk = 1; s.pop = 1; s.brow = 1; sfx.honk(); },
+    shake(e) {
+      e.state.spin = 1.2; sfx.boing();
+      for (let i = 0; i < 3; i++) spawnParticle('ball', e.x, e.y, { vy: -rand(300, 600), size: rand(7, 11) });
+    },
+  };
+
+  KINDS.chicken = {
+    r: 34, gravity: 950, drag: 0.7, bounce: 0.6, foot: 1,
+    init: () => ({ stretch: 0, stv: 0, beak: 0, flail: 0, googly: [mkGoogly(0.34, -0.8, 0.13)] }),
+    update(e, dt) {
+      const s = e.state;
+      s.stv += (-140 * s.stretch - 7 * s.stv) * dt; s.stretch += s.stv * dt;
+      s.beak = Math.max(0, s.beak - dt * 2); s.flail = Math.max(0, s.flail - dt);
+      s.googly[0].y = -0.8 - s.stretch * 0.5;
+      tickGoogly(e, dt);
+      hopper(e, dt, 2, 5, 380);
+      const wiggle = s.flail > 0 ? Math.sin(game.time * 30) * 0.4 : 0;
+      if (!e.dragging) e.rot = lerpAngle(e.rot, Math.sin(game.time * 3 + e.seed * 9) * 0.1 + wiggle, dt * 6);
+    },
+    draw(e) {
+      const s = e.state, r = e.r, hx = r * 0.38, hy = -r * (0.8 + s.stretch * 0.5);
+      const fl = s.flail > 0 ? Math.sin(game.time * 35) : Math.sin(game.time * 3) * 0.2;
+      for (const side of [-1, 1]) {
+        const lx = side * r * 0.2 - r * 0.05, fx = lx + fl * side * r * 0.25, fy = r * 0.95;
+        line([lx, r * 0.55, fx, fy], '#e88a12', 2.5);
+        line([fx - r * 0.12, fy, fx, fy - r * 0.03, fx + r * 0.12, fy], '#e88a12', 2.5);
+      }
+      ctx.beginPath(); ctx.moveTo(-r * 0.55, r * 0.1); ctx.lineTo(-r * 0.95, -r * 0.2); ctx.lineTo(-r * 0.75, r * 0.3); ctx.closePath();
+      ctx.fillStyle = '#ffd23f'; ctx.fill(); ctx.strokeStyle = OUTLINE; ctx.lineWidth = 2.2; ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(r * 0.25, r * 0.05); ctx.quadraticCurveTo(r * 0.5, (hy + r * 0.05) / 2, hx, hy);
+      ctx.strokeStyle = OUTLINE; ctx.lineWidth = r * 0.28; ctx.stroke();
+      ctx.strokeStyle = '#ffd23f'; ctx.lineWidth = r * 0.28 - 5; ctx.stroke();
+      ellipse(-r * 0.1, r * 0.22, r * 0.62, r * 0.42, '#ffd23f', OUTLINE, 2.5);
+      ctx.save(); ctx.translate(-r * 0.1, r * 0.15); ctx.rotate(-0.3 + fl * 0.6);
+      ellipse(-r * 0.1, 0, r * 0.32, r * 0.18, '#ffc61a', OUTLINE, 2);
+      ctx.restore();
+      for (let i = 0; i < 3; i++) ellipse(hx - r * 0.12 + i * r * 0.11, hy - r * 0.22, r * 0.07, r * 0.09, '#e8262b', OUTLINE, 1.5);
+      ellipse(hx, hy, r * 0.24, r * 0.22, '#ffd23f', OUTLINE, 2.5);
+      const bo = s.beak * r * 0.18;
+      ctx.fillStyle = '#ff9f1c'; ctx.strokeStyle = OUTLINE; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(hx + r * 0.18, hy - r * 0.06); ctx.lineTo(hx + r * 0.52, hy - bo * 0.6); ctx.lineTo(hx + r * 0.18, hy + r * 0.03); ctx.closePath(); ctx.fill(); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(hx + r * 0.18, hy + r * 0.04); ctx.lineTo(hx + r * 0.42, hy + r * 0.06 + bo); ctx.lineTo(hx + r * 0.18, hy + r * 0.11); ctx.closePath(); ctx.fill(); ctx.stroke();
+      drawGoogly(e, s.googly[0]);
+    },
+    tap(e) { const s = e.state; s.stv += 16; s.beak = 1; sfx.squawk(); if (e.onFloor) e.vy = -260; },
+    shake(e) {
+      const s = e.state;
+      s.flail = 1.4; s.beak = 1; sfx.squawk(); sfx.squawk(0.25);
+      burst('feather', e.x, e.y, 8, { color: '#ffd23f' });
+      if (e.r > 18) spawnChild(e, 'chicken', 0.62, 280);
+    },
+  };
+
+  KINDS.banana = {
+    r: 34, wander: 18, drag: 1.3,
+    init: () => ({ peeled: false, shades: true }),
+    update(e) { if (!e.dragging) e.rot = Math.sin(game.time * Math.PI * (BPM / 60) + e.seed * 6) * 0.35; },
+    draw(e) {
+      const s = e.state, r = e.r;
+      bananaPath(r);
+      ctx.fillStyle = s.peeled ? '#fff3c4' : '#ffe135'; ctx.fill();
+      ctx.strokeStyle = OUTLINE; ctx.lineWidth = 2.5; ctx.stroke();
+      if (s.peeled) {
+        for (const side of [-1, 1]) {
+          ctx.save(); ctx.translate(side * r * 0.8, -r * 0.45); ctx.rotate(side * (0.3 + Math.sin(game.time * 6) * 0.1));
+          ctx.beginPath(); ctx.moveTo(-r * 0.12, 0);
+          ctx.quadraticCurveTo(side * r * 0.1, r * 0.6, 0, r * 0.75);
+          ctx.quadraticCurveTo(-side * r * 0.05, r * 0.4, r * 0.12, 0);
+          ctx.closePath(); ctx.fillStyle = '#ffe135'; ctx.fill(); ctx.stroke();
+          ctx.restore();
+        }
+      }
+      for (const side of [-1, 1]) ellipse(side * r * 0.88, -r * 0.5, r * 0.07, r * 0.06, '#5a3d1e');
+      const fy = r * 0.14;
+      if (s.shades) drawShades(0, fy, r * 0.17);
+      else for (const side of [-1, 1]) ellipse(side * r * 0.15, fy, r * 0.04, r * 0.05, OUTLINE);
+      ctx.beginPath(); ctx.arc(0, fy + r * 0.03, r * 0.12, 0.2, Math.PI - 0.2);
+      ctx.strokeStyle = OUTLINE; ctx.lineWidth = 2; ctx.stroke();
+    },
+    tap(e) {
+      const s = e.state;
+      s.peeled = !s.peeled; e.sqv += 5;
+      if (s.peeled) sfx.slideDown(); else sfx.slideUp();
+    },
+    shake(e) {
+      const s = e.state;
+      if (s.shades) { s.shades = false; spawnParticle('shades', e.x, e.y, { vy: -300, size: e.r * 0.17 }); }
+      sfx.boing();
+      if (e.r > 18) spawnChild(e, 'banana', 0.72, 260);
+    },
+  };
+
+  KINDS.cushion = {
+    r: 32, gravity: 950, drag: 0.8, bounce: 0.5, foot: 0.6,
+    init: () => ({ deflate: 0, zoom: 0, puff: 0 }),
+    update(e, dt) {
+      const s = e.state;
+      s.deflate = Math.max(0, s.deflate - dt * 0.5);
+      if (s.zoom <= 0 || e.dragging) {
+        if (!e.dragging) e.rot = lerpAngle(e.rot, 0, dt * 4);
+        return;
+      }
+      // a released balloon: thrust away from the nozzle, puffing as it goes
+      s.zoom -= dt; e.rot += Math.sin(game.time * 7) * dt * 6;
+      e.vx -= Math.cos(e.rot) * 1800 * dt; e.vy -= Math.sin(e.rot) * 1800 * dt + 950 * dt;
+      s.puff -= dt;
+      if (s.puff < 0) {
+        s.puff = 0.06;
+        spawnParticle('cloud', e.x + Math.cos(e.rot) * e.r, e.y + Math.sin(e.rot) * e.r, { vx: Math.cos(e.rot) * 80, vy: Math.sin(e.rot) * 80, size: rand(6, 10), life: 0.9 });
+      }
+    },
+    draw(e) {
+      const s = e.state, r = e.r, h = r * 0.62 * (1 - s.deflate * 0.55);
+      ctx.beginPath(); ctx.moveTo(r * 0.85, -r * 0.1); ctx.lineTo(r * 1.2, -r * 0.14); ctx.lineTo(r * 1.2, r * 0.14); ctx.lineTo(r * 0.85, r * 0.1); ctx.closePath();
+      ctx.fillStyle = '#ff7eb6'; ctx.fill(); ctx.strokeStyle = OUTLINE; ctx.lineWidth = 2.2; ctx.stroke();
+      ellipse(0, 0, r, h, '#ff7eb6', OUTLINE, 2.5);
+      ellipse(-r * 0.4, -h * 0.45, r * 0.25, h * 0.18, 'rgba(255,255,255,0.6)');
+      const squint = s.deflate > 0.3 ? 0.25 : 1;
+      for (const side of [-1, 1]) ellipse(side * r * 0.25, -h * 0.1, r * 0.06, r * 0.08 * squint, OUTLINE);
+      ctx.beginPath(); ctx.arc(0, h * 0.05, r * 0.16, 0.25, Math.PI - 0.25);
+      ctx.strokeStyle = OUTLINE; ctx.lineWidth = 2; ctx.stroke();
+    },
+    tap(e) {
+      e.state.deflate = 1; e.sqv += 8; sfx.fart();
+      burst('cloud', e.x + e.r, e.y, 5, { vy: -40, size: 8, life: 1 });
+    },
+    shake(e) { e.state.zoom = 1.5; e.state.deflate = 1; sfx.fart(); sfx.fart(0.5); },
+  };
+
+  // ---------- entity physics ----------
+  function collideWalls(e, k) {
+    const m = e.r * 0.8, b = k.bounce ?? 0.5;
+    if (e.x < m) { e.x = m; e.vx = Math.abs(e.vx) * b; }
+    if (e.x > W - m) { e.x = W - m; e.vx = -Math.abs(e.vx) * b; }
+    if (e.y < m) { e.y = m; e.vy = Math.abs(e.vy) * b; }
+    const floor = H - e.r * (k.foot ?? 0.85);
+    e.onFloor = false;
+    if (e.y <= floor) return;
+    e.y = floor;
+    if (e.vy > 120) e.sqv += Math.min(6, e.vy / 160);
+    e.vy = -Math.abs(e.vy) * b;
+    if (Math.abs(e.vy) < 40) { e.vy = 0; e.onFloor = true; }
+    e.vx *= 0.92;
+  }
+  function pushFromButton(e) {
+    const dx = e.x - button.x, dy = e.y - button.y;
+    const d = Math.hypot(dx, dy), min = button.r + e.r * 0.6;
+    if (d < 0.01 || d >= min) return;
+    const f = (min - d) / d;
+    e.x += dx * f * 0.3; e.y += dy * f * 0.3; e.vx += dx * f * 4; e.vy += dy * f * 4;
+  }
+  function stepEntity(e, dt) {
+    const k = KINDS[e.kind];
+    e.age += dt;
+    if (!e.dragging) {
+      if (k.gravity) e.vy += k.gravity * dt;
+      if (k.wander) {
+        e.vx += Math.sin(game.time * 0.7 + e.seed * 40) * k.wander * dt * 3;
+        e.vy += Math.cos(game.time * 0.9 + e.seed * 70) * k.wander * dt * 3;
+      }
+      const drag = 1 - Math.min(1, (k.drag ?? 1) * dt);
+      e.vx *= drag;
+      if (!k.gravity) e.vy *= drag;
+      e.x += e.vx * dt; e.y += e.vy * dt;
+      e.rot += e.vr * dt; e.vr *= 1 - Math.min(1, dt * 2);
+      if (k.upright) e.rot = lerpAngle(e.rot, 0, dt * 5);
+      collideWalls(e, k);
+      if (!game.finale) pushFromButton(e);
+    }
+    e.sqv += (-170 * e.sq - 9 * e.sqv) * dt;
+    e.sq = clamp(e.sq + e.sqv * dt, -0.35, 0.35);
+    if (k.update) k.update(e, dt);
+    e.lvx = e.vx; e.lvy = e.vy;
+    if (e.dying) { e.fade -= dt * 2.5; if (e.fade <= 0) e.dead = true; }
+  }
+  function drawEntity(e) {
+    const grow = e.age < 0.3 ? easeOutBack(e.age / 0.3) : 1;
+    let sc = grow * (1 + game.inflate) * (e.dying ? Math.max(0.01, e.fade) : 1);
+    if (game.era === 3 || game.finale) sc *= 1 + game.bop * 0.08;
+    ctx.save();
+    ctx.globalAlpha = clamp(e.fade, 0, 1);
+    ctx.translate(e.x, e.y);
+    ctx.rotate(e.rot);
+    ctx.scale(sc * (1 + e.sq), sc * (1 - e.sq));
+    if (game.era === 2 && !game.transition) ctx.transform(1, 0, Math.sin(game.time * 1.7 + e.seed * 9) * 0.12 * (0.4 + eraT()), 1, 0, 0);
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    KINDS[e.kind].draw(e);
+    ctx.restore();
+  }
+
+  // ---------- particles ----------
+  const PTYPES = {
+    drop: { g: 500, color: '#141014' }, heart: { g: -40 }, star: { g: 300 }, sparkle: { g: 0 },
+    shell: { g: 1000, bounce: 0.4 }, feather: { g: 50, flutter: true }, tooth: { g: 1100, bounce: 0.45 },
+    confetti: { g: 220, flutter: true }, cloud: { g: -30 }, ball: { g: 1100, bounce: 0.75 },
+    smoke: { g: -50 }, shades: { g: 1000, bounce: 0.3 }, ring: { g: 0 }, eyelet: { g: 0 },
+  };
+  function spawnParticle(type, x, y, o = {}) {
+    if (game.particles.length >= MAX_PARTICLES) game.particles.shift();
+    game.particles.push({
+      type, x, y,
+      vx: o.vx ?? rand(-140, 140), vy: o.vy ?? rand(-280, -80),
+      age: 0, life: o.life ?? rand(0.9, 1.6), size: o.size ?? rand(5, 10),
+      rot: rand(0, TAU), vr: rand(-6, 6), seed: Math.random(),
+      color: o.color ?? PTYPES[type].color ?? pick(CONFETTI),
+    });
+  }
+  function stepParticles(dt) {
+    for (const p of game.particles) {
+      const t = PTYPES[p.type];
+      p.age += dt; p.vy += t.g * dt;
+      p.vx *= 1 - Math.min(1, dt * 0.8);
+      if (t.flutter) { p.vy *= 1 - Math.min(1, dt * 1.5); p.vx += Math.sin(game.time * 4 + p.seed * 20) * 60 * dt; }
+      p.x += p.vx * dt; p.y += p.vy * dt; p.rot += p.vr * dt;
+      if (t.bounce && p.y > H - p.size) { p.y = H - p.size; p.vy = -Math.abs(p.vy) * t.bounce; p.vx *= 0.8; }
+    }
+    game.particles = game.particles.filter(p => p.age < p.life && p.y < H + 60);
+  }
+  function heartPath(s) {
+    ctx.beginPath(); ctx.moveTo(0, s * 0.35);
+    ctx.bezierCurveTo(-s * 1.1, -s * 0.35, -s * 0.45, -s * 1.15, 0, -s * 0.45);
+    ctx.bezierCurveTo(s * 0.45, -s * 1.15, s * 1.1, -s * 0.35, 0, s * 0.35);
+  }
+  function starPath(s) {
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const a = -Math.PI / 2 + (i * Math.PI) / 5, rr = i % 2 ? s * 0.45 : s;
+      ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr);
+    }
+    ctx.closePath();
+  }
+  function sparklePath(s) {
+    ctx.beginPath(); ctx.moveTo(0, -s);
+    ctx.quadraticCurveTo(0, 0, s, 0); ctx.quadraticCurveTo(0, 0, 0, s);
+    ctx.quadraticCurveTo(0, 0, -s, 0); ctx.quadraticCurveTo(0, 0, 0, -s);
+  }
+  function drawParticle(p) {
+    const k = p.age / p.life, s = p.size;
+    ctx.save();
+    ctx.globalAlpha = p.type === 'eyelet' ? 1 : clamp(1 - k * k, 0, 1);
+    ctx.translate(p.x, p.y);
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    switch (p.type) {
+      case 'drop':
+        ctx.fillStyle = p.color; ctx.beginPath(); ctx.moveTo(0, -s);
+        ctx.bezierCurveTo(s * 0.8, 0, s * 0.6, s * 0.8, 0, s * 0.8);
+        ctx.bezierCurveTo(-s * 0.6, s * 0.8, -s * 0.8, 0, 0, -s); ctx.fill();
+        break;
+      case 'heart': ctx.rotate(Math.sin(p.rot) * 0.3); heartPath(s); ctx.fillStyle = '#ff6b9a'; ctx.fill(); break;
+      case 'star': ctx.rotate(p.rot); starPath(s); ctx.fillStyle = '#ffd23f'; ctx.fill(); break;
+      case 'sparkle': {
+        const sc = Math.max(0.01, Math.sin(k * Math.PI));
+        ctx.scale(sc, sc); sparklePath(s * 1.3); ctx.fillStyle = p.color; ctx.fill();
+        break;
+      }
+      case 'shell':
+        ctx.rotate(p.rot); ctx.beginPath(); ctx.moveTo(-s, s * 0.5); ctx.lineTo(-s * 0.3, -s * 0.6); ctx.lineTo(0, -s * 0.1); ctx.lineTo(s * 0.4, -s * 0.7); ctx.lineTo(s, s * 0.5); ctx.closePath();
+        ctx.fillStyle = '#fff8ea'; ctx.fill(); ctx.strokeStyle = OUTLINE; ctx.lineWidth = 1.5; ctx.stroke();
+        break;
+      case 'feather':
+        ctx.rotate(Math.sin(game.time * 3 + p.seed * 9) * 0.8);
+        ellipse(0, 0, s * 0.4, s, p.color, OUTLINE, 1);
+        line([0, -s, 0, s], OUTLINE, 0.8);
+        break;
+      case 'tooth':
+        ctx.rotate(p.rot);
+        for (const side of [-1, 1]) ellipse(side * s * 0.28, s * 0.35, s * 0.2, s * 0.4, '#f1e7d2', OUTLINE, 1.2);
+        ellipse(0, -s * 0.15, s * 0.6, s * 0.48, '#fbf6ea', OUTLINE, 1.5);
+        break;
+      case 'confetti':
+        ctx.rotate(p.rot); ctx.scale(1, Math.cos(game.time * 8 + p.seed * 10));
+        ctx.fillStyle = p.color; ctx.fillRect(-s * 0.5, -s * 0.3, s, s * 0.6);
+        break;
+      case 'cloud': {
+        const g = s * (1 + k * 1.5);
+        for (const [x, y, f] of [[-0.6, 0.1, 0.7], [0, -0.2, 1], [0.6, 0.1, 0.75]]) ellipse(x * g, y * g, g * f, g * f, 'rgba(160,185,110,0.5)');
+        break;
+      }
+      case 'ball': ellipse(0, 0, s, s, '#e8262b', OUTLINE, 1.5); ellipse(-s * 0.3, -s * 0.3, s * 0.3, s * 0.2, 'rgba(255,255,255,0.8)'); break;
+      case 'smoke': ellipse(0, 0, s * (1 + k * 2), s * (1 + k * 2), 'rgba(15,12,14,0.5)'); break;
+      case 'shades': ctx.rotate(p.rot * 0.3); drawShades(0, 0, s); break;
+      case 'ring':
+        ctx.strokeStyle = 'rgba(25,12,14,0.6)'; ctx.lineWidth = 2 * (1 - k) + 0.5;
+        ctx.beginPath(); ctx.arc(0, 0, s + k * 70, 0, TAU); ctx.stroke();
+        break;
+      case 'eyelet': drawEyeball(0, 0, s, lookDir(p.x, p.y, 0), { blink: 1 - Math.sin(k * Math.PI), veins: 2, seed: p.seed }); break;
+      default: break;
+    }
+    ctx.restore();
+  }
+
+  // ---------- the button ----------
+  function buttonColors(era, t) {
+    if (era === 0) return { base: mixHex('#f1f1f3', '#a8343a', t * t * 0.85), rim: mixHex('#c9c9cf', '#5e1418', t * t * 0.85), hi: 'rgba(255,255,255,0.75)' };
+    if (era === 1) return { base: '#ff9ec4', rim: '#e0709b', hi: 'rgba(255,255,255,0.7)' };
+    if (era === 2) return { base: '#e2a594', rim: '#a8665a', hi: 'rgba(255,240,230,0.5)' };
+    return { base: '#ec2a2f', rim: '#a5141a', hi: 'rgba(255,255,255,0.85)' };
+  }
+  function drawCracks(r, y, k) {
+    ctx.save();
+    ctx.beginPath(); ctx.ellipse(0, y, r, r * 0.94, 0, 0, TAU); ctx.clip();
+    for (const a of [2.4, 0.4, -1.2]) {
+      let x = r * 0.1, yy = y - r * 0.2;
+      const pts = [x, yy];
+      for (let i = 1; i <= 4; i++) {
+        const turn = a + (i % 2 ? 0.5 : -0.5), len = r * 0.22 * k;
+        x += Math.cos(turn) * len; yy += Math.sin(turn) * len; pts.push(x, yy);
+      }
+      line(pts, '#2a1012', 1.8);
+    }
+    ctx.restore();
+    if (k <= 0.5) return;
+    const dl = (k - 0.5) * r * 1.4;
+    ctx.fillStyle = '#5e1418';
+    ctx.beginPath(); ctx.moveTo(r * 0.25, r * 0.95); ctx.quadraticCurveTo(r * 0.3, r * 0.95 + dl, r * 0.35, r * 0.95); ctx.fill();
+    ellipse(r * 0.3, r + dl * 0.8, r * 0.07, r * 0.09, '#5e1418');
+  }
+  function drawFleshButton(r, y) {
+    ctx.strokeStyle = 'rgba(150,40,50,0.45)'; ctx.lineWidth = 1.4;
+    for (let i = 0; i < 6; i++) {
+      const a = i * 1.05 + 0.3;
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(a) * r * 0.92, y + Math.sin(a) * r * 0.86);
+      ctx.quadraticCurveTo(Math.cos(a + 0.4) * r * 0.7, y + Math.sin(a + 0.4) * r * 0.65, Math.cos(a) * r * 0.5, y + Math.sin(a) * r * 0.48);
+      ctx.stroke();
+    }
+    drawEyeball(0, y, r * 0.42, lookDir(button.x, button.y, 0), { blink: button.blink, veins: 5, iris: '#4f7a3a', seed: 0.3 });
+  }
+  function drawButton() {
+    const b = button, r = b.r, era = game.era, col = buttonColors(era, eraT());
+    const idle = game.started ? 0 : Math.sin(game.time * 2.2) * 0.03;
+    const pulse = era === 2 ? Math.sin(game.time * 4.5) * 0.04 : 0;
+    const bop = era === 3 || game.finale ? game.bop * 0.07 : 0;
+    const sc = 1 + idle + pulse + bop, lift = (1 - b.press) * r * 0.1;
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    ctx.scale(sc * (1 + b.press * 0.12), sc * (1 - b.press * 0.12));
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ellipse(0, r * 0.16, r * 1.04, r * 0.98, col.rim, OUTLINE, 3);
+    ellipse(0, -lift, r, r * 0.94, col.base, OUTLINE, 3);
+    ellipse(-r * 0.36, -lift - r * 0.38, r * 0.26, r * 0.14, col.hi);
+    if (era === 0 && eraT() > 0.35) drawCracks(r, -lift, (eraT() - 0.35) / 0.65);
+    else if (era === 1) drawCuteFace(r, 0, -lift + r * 0.05, { happy: b.press > 0.1 ? 1 : 0, blink: b.blink }, { spread: 0.3, eye: 0.09 });
+    else if (era === 2) drawFleshButton(r, -lift);
+    else if (era === 3) ellipse(r * 0.3, -lift - r * 0.5, r * 0.1, r * 0.07, col.hi);
+    ctx.restore();
+  }
+  function updateButton(dt) {
+    const vacuum = !!game.finale && game.finale.t >= FINALE.dance;
+    const homeTarget = game.started && !vacuum ? 1 : 0;
+    button.home += (homeTarget - button.home) * Math.min(1, dt * 4);
+    button.r += ((vacuum ? FINALE_BUTTON_R : BUTTON_R) - button.r) * Math.min(1, dt * 4);
+    button.x = W / 2;
+    button.y = lerp(H / 2, H - Math.max(90, H * 0.14), button.home);
+    button.press = Math.max(0, button.press - dt * 5);
+    tickBlink(button, dt, 1.5, 4);
+  }
+
+  // ---------- eras ----------
+  const spawnKind = () => pick(SPAWN_STAGES[game.era][Math.min(2, Math.floor(eraT() * 3))]);
+  const TRANSITION_FX = [
+    {
+      particle: 'sparkle',
+      start: () => { sfx.stinger(0.2); audio.tone(55, 1.4, { type: 'sawtooth', lp: 300, vol: 0.25 }); },
+      convert: () => [523, 659, 784, 1047].forEach((f, i) => audio.tone(f, 0.5, { delay: i * 0.07, vol: 0.12, type: 'triangle' })),
+    },
+    {
+      particle: 'drop',
+      start: () => { for (let i = 0; i < 6; i++) audio.tone(70, 0.3, { to: 40, vol: 0.3, delay: i * 0.3 }); },
+      convert: () => sfx.squelch(),
+    },
+    {
+      particle: 'confetti',
+      start: () => sfx.slideUp(),
+      convert: () => { sfx.pop(); sfx.honk(); [392, 523, 659, 784].forEach((f, i) => sfx.kazoo(f, i * 0.12)); },
+    },
+  ];
+  function addProgress(n) {
+    if (game.transition || game.finale) return;
+    game.progress += n;
+    if (game.progress < ERA_LENGTH) return;
+    if (game.era < 3) startTransition(); else startFinale();
+  }
+  function startTransition() {
+    const from = game.era;
+    game.transition = {
+      from, t: 0, converted: false,
+      eyes: Array.from({ length: 12 }, () => ({ x: rand(30, W - 30), y: rand(40, H - 60), d: rand(0, 0.3) })),
+    };
+    TRANSITION_FX[from].start();
+  }
+  function convertEra(tr) {
+    const to = tr.from + 1, fx = TRANSITION_FX[tr.from];
+    tr.converted = true; game.era = to; game.progress = 0; game.inflate = 0;
+    for (const e of [...game.entities]) {
+      if (e.dying) continue;
+      replaceEntity(e, makeEntity(MORPH[e.kind] ?? pick(SPAWN_STAGES[to][2]), e.x, e.y));
+      burst(fx.particle, e.x, e.y, 6, fx.particle === 'drop' ? { color: '#b8606a' } : {});
+    }
+    fx.convert();
+  }
+  function updateTransition(dt) {
+    const tr = game.transition;
+    if (!tr) return;
+    const spec = TRANSITIONS[tr.from];
+    tr.t += dt;
+    const p = tr.t / spec.dur;
+    if (tr.from === 1) game.quake = Math.max(game.quake, 5 * Math.sin(Math.min(1, p) * Math.PI));
+    game.inflate = tr.from === 2 && p < spec.convertAt ? easeOut(p / spec.convertAt) * 0.45 : 0;
+    if (!tr.converted && p >= spec.convertAt) convertEra(tr);
+    if (p >= 1) game.transition = null;
+  }
+  function startFinale() {
+    game.finale = { t: 0, vacuumStarted: false };
+    game.beatTimer = 0;
+    sfx.slideUp();
+  }
+  function updateFinale(dt) {
+    const f = game.finale;
+    if (!f) return;
+    f.t += dt;
+    if (f.t < FINALE.dance) {
+      if (Math.random() < dt * 25) spawnParticle('confetti', rand(0, W), -10, { vx: rand(-40, 40), vy: rand(60, 160), life: 4 });
+      return;
+    }
+    if (!f.vacuumStarted) {
+      f.vacuumStarted = true; sfx.slideDown();
+      drags.clear();
+      for (const e of game.entities) e.dragging = false;
+    }
+    if (f.t >= FINALE.end) { resetToStart(); return; }
+    if (f.t >= FINALE.vacuum) return;
+    // everything gets sucked back into the button
+    for (const e of game.entities) {
+      const dx = button.x - e.x, dy = button.y - e.y, d = Math.hypot(dx, dy) || 1;
+      e.vx += (dx / d) * 2400 * dt; e.vy += (dy / d) * 2400 * dt; e.rot += dt * 10;
+      if (d < button.r * 0.8 && !e.dying) { e.dying = true; if (Math.random() < 0.5) sfx.pop(); }
+    }
+  }
+  function resetToStart() {
+    game.entities = []; game.particles = []; game.finale = null;
+    game.era = 0; game.progress = 0; game.started = false;
+    drags.clear();
+  }
+
+  // ---------- ambience ----------
+  function maybePeek() {
+    game.peek = { side: Math.random() < 0.5 ? -1 : 1, y: rand(H * 0.15, H * 0.7), t: 0, dur: rand(1.2, 2.2) };
+  }
+  function tickBeat(dt, loud) {
+    game.beatTimer -= dt;
+    if (game.beatTimer > 0) return;
+    game.beatTimer = Math.max(game.beatTimer + 60 / BPM, 0.05);
+    const n = game.beatCount++;
+    game.bop = 1;
+    if (!loud) return;
+    sfx.kick();
+    sfx.bass([98, 98, 147, 131][Math.floor(n / 2) % 4] * (n % 2 ? 2 : 1));
+    if (game.finale) sfx.kazoo([523, 587, 659, 784, 659, 587, 523, 392][n % 8]);
+  }
+  function updateAmbient(dt) {
+    const t = eraT(), era = game.era;
+    game.quake *= Math.pow(0.03, dt);
+    game.dark = Math.max(0, game.dark - dt * 1.2);
+    game.flicker = Math.max(0, game.flicker - dt);
+    game.bop = Math.max(0, game.bop - dt * 4);
+    if (game.peek) { game.peek.t += dt; if (game.peek.t > game.peek.dur) game.peek = null; }
+    audio.setDrone(era === 0 && game.started && !game.transition ? 0.015 + t * 0.12 : 0);
+    if (game.finale) { tickBeat(dt, true); return; }
+    if (!game.started || game.transition) return;
+    if (era === 0) {
+      if (t > 0.25 && Math.random() < dt * (0.03 + 0.2 * t)) {
+        game.flicker = rand(0.08, 0.18);
+        game.flickPos = { x: rand(40, W - 40), y: rand(60, H - 160) };
+        audio.hiss(0.15, { f: 3000, q: 0.5, vol: 0.08 });
+      }
+      if (t > 0.5 && !game.peek && Math.random() < dt * 0.12) maybePeek();
+      game.heartTimer -= dt;
+      if (game.heartTimer < 0) { game.heartTimer = lerp(1.5, 0.55, t); if (t > 0.3) sfx.heartbeat(0.12 + t * 0.25); }
+    } else if (era === 1) {
+      if (Math.random() < dt * 2) spawnParticle('sparkle', rand(0, W), rand(0, H), { vx: 0, vy: rand(-20, 20), life: rand(0.8, 1.6), color: pick(['#ffb3d1', '#b5e8ff', '#ffe08a', '#c9b8ff']) });
+      if (Math.random() < dt * 0.5) sfx.twinkle();
+    } else if (era === 2) {
+      if (Math.random() < dt * 0.6) sfx.musicbox();
+      if (Math.random() < dt * 0.12) audio.hiss(0.25, { type: 'lowpass', f: 900, to: 150, vol: 0.12 });
+    } else {
+      if (Math.random() < dt * (0.5 + t * 2)) spawnParticle('confetti', rand(0, W), -10, { vx: rand(-30, 30), vy: rand(40, 120), life: 4 });
+      tickBeat(dt, t > 0.35);
+    }
+  }
+
+  // ---------- overlays ----------
+  function fillScreen(style) { ctx.fillStyle = style; ctx.fillRect(0, 0, W, H); }
+  function drawBackground() {
+    const target = BG[game.era];
+    game.bg = game.bg.map((c, i) => lerp(c, target[i], 0.04));
+    fillScreen(`rgb(${game.bg.map(Math.round).join(',')})`);
+  }
+  function drawVignette() {
+    if (game.era !== 0 || !game.started || eraT() < 0.05) return;
+    const g = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.25, W / 2, H / 2, Math.max(W, H) * 0.75);
+    g.addColorStop(0, 'rgba(20,5,8,0)'); g.addColorStop(1, `rgba(20,5,8,${0.65 * eraT()})`);
+    fillScreen(g);
+  }
+  function drawPeek() {
+    const pk = game.peek;
+    if (!pk) return;
+    const out = Math.sin((pk.t / pk.dur) * Math.PI), x = pk.side < 0 ? -40 + out * 34 : W + 40 - out * 34;
+    ellipse(x, pk.y, 40, 48, `rgba(12,10,11,${out})`);
+    const ex = x - pk.side * 18;
+    for (const side of [-1, 1]) ellipse(ex + side * 8, pk.y - 6, 4, 2.5, `rgba(255,255,255,${out})`);
+  }
+  function drawDarkness() {
+    if (game.dark > 0) fillScreen(`rgba(0,0,0,${game.dark * 0.85})`);
+    if (game.flicker <= 0) return;
+    fillScreen(REDUCED ? 'rgba(0,0,0,0.35)' : 'rgba(0,0,0,0.94)');
+    for (const side of [-1, 1]) {
+      ellipse(game.flickPos.x + side * 11, game.flickPos.y, 6, 3.2, '#f6f2ee');
+      ellipse(game.flickPos.x + side * 11, game.flickPos.y, 1.6, 1.6, '#b3121c');
+    }
+  }
+  function drawTransitionOverlay() {
+    const tr = game.transition;
+    if (!tr) return;
+    const spec = TRANSITIONS[tr.from], p = tr.t / spec.dur, c = spec.convertAt;
+    const flashOut = () => fillScreen(`rgba(255,255,255,${clamp(1 - (p - c) / (1 - c), 0, 1)})`);
+    if (tr.from === 0) {
+      if (p >= c) { flashOut(); return; }
+      fillScreen(`rgba(8,6,8,${easeOut(Math.min(1, p / 0.4))})`);
+      for (const eye of tr.eyes) {
+        const local = (p - 0.2 - eye.d) / 0.3;
+        if (local <= 0) continue;
+        const open = Math.min(1, local * 3) * (Math.sin(game.time * 9 + eye.x) > 0.92 ? 0.1 : 1);
+        for (const side of [-1, 1]) {
+          ellipse(eye.x + side * 10, eye.y, 6, 3.4 * open, '#f6f2ee');
+          ellipse(eye.x + side * 10, eye.y, 1.6, 1.6 * open, '#b3121c');
+        }
+      }
+    } else if (tr.from === 1) {
+      const env = p < c ? p / c : 1 - (p - c) / (1 - c);
+      const beat = Math.pow(Math.max(0, Math.sin(p * Math.PI * 7)), 3);
+      fillScreen(`rgba(185,95,90,${clamp(0.35 * env * beat + 0.1 * env, 0, 1)})`);
+    } else if (p >= c) flashOut();
+  }
+
+  // ---------- input ----------
+  function hitEntity(x, y) {
+    for (let i = game.entities.length - 1; i >= 0; i--) {
+      const e = game.entities[i];
+      if (!e.dying && Math.hypot(e.x - x, e.y - y) < e.r * (KINDS[e.kind].hit ?? 1.1)) return e;
+    }
+    return null;
+  }
+  function pressButton() {
+    if (game.finale || game.transition) { button.press = 0.5; return; }
+    button.press = 1;
+    game.started = true;
+    PRESS_SOUNDS[game.era]();
+    const e = makeEntity(spawnKind(), button.x, button.y - button.r * 0.6);
+    e.vx = rand(-170, 170); e.vy = rand(-560, -400); e.vr = rand(-3, 3);
+    addEntity(e);
+    addProgress(1);
+  }
+  function tapEntity(e) {
+    if (e.dying) return;
+    KINDS[e.kind].tap(e);
+    e.sqv += 5;
+    addProgress(1);
+  }
+  function shakeEntity(e) {
+    if (e.dying) return;
+    KINDS[e.kind].shake(e);
+    e.vr += rand(-8, 8);
+    addProgress(1.5);
+  }
+  function tapEmpty(x, y) {
+    if (game.finale) return;
+    const era = game.era;
+    if (era === 0) {
+      spawnParticle('ring', x, y, { vx: 0, vy: 0, life: 0.9, size: 4 });
+      if (game.started) sfx.thump(0.1);
+      if (eraT() > 0.4 && !game.peek && Math.random() < 0.25) maybePeek();
+    } else if (era === 1) {
+      spawnParticle('heart', x, y, { vx: 0, vy: -120, size: 9 }); sfx.pop();
+    } else if (era === 2) {
+      spawnParticle('eyelet', x, y, { vx: 0, vy: 0, life: 1.1, size: rand(9, 15) });
+      audio.hiss(0.18, { type: 'lowpass', f: 1200, to: 200, vol: 0.18 });
+    } else {
+      burst('confetti', x, y, 7); sfx.squeak();
+    }
+    if (game.started) addProgress(0.15);
+  }
+  function onDown(ev) {
+    ev.preventDefault();
+    audio.unlock();
+    const x = ev.clientX, y = ev.clientY, now = performance.now();
+    game.pointer = { x, y };
+    if (Math.hypot(x - button.x, y - button.y) < button.r * 1.25) { pressButton(); return; }
+    const e = game.finale ? null : hitEntity(x, y);
+    if (!e) { tapEmpty(x, y); return; }
+    e.dragging = true; e.vx = 0; e.vy = 0;
+    drags.set(ev.pointerId, { e, ox: e.x - x, oy: e.y - y, sx: x, sy: y, st: now, lx: x, ly: y, lt: now, ax: x, ay: y, dirX: 0, dirY: 0, flips: [], lastShake: 0, moved: 0 });
+  }
+  function onMove(ev) {
+    const x = ev.clientX, y = ev.clientY, now = performance.now();
+    game.pointer = { x, y };
+    const d = drags.get(ev.pointerId);
+    if (!d) return;
+    ev.preventDefault();
+    const e = d.e, dts = Math.max(1, now - d.lt) / 1000;
+    d.moved = Math.max(d.moved, Math.hypot(x - d.sx, y - d.sy));
+    e.x = x + d.ox; e.y = y + d.oy;
+    e.vx = lerp(e.vx, (x - d.lx) / dts, 0.5); e.vy = lerp(e.vy, (y - d.ly) / dts, 0.5);
+    d.lx = x; d.ly = y; d.lt = now;
+    // shaking = the finger reverses direction several times in quick succession
+    const adx = x - d.ax, ady = y - d.ay;
+    if (Math.hypot(adx, ady) < 8) return;
+    d.ax = x; d.ay = y;
+    const horizontal = Math.abs(adx) > Math.abs(ady), sign = Math.sign(horizontal ? adx : ady), prev = horizontal ? d.dirX : d.dirY;
+    if (prev && sign !== prev) d.flips.push(now);
+    if (horizontal) d.dirX = sign; else d.dirY = sign;
+    d.flips = d.flips.filter(ft => now - ft < SHAKE_WINDOW_MS);
+    if (d.flips.length >= SHAKE_REVERSALS && now - d.lastShake > SHAKE_COOLDOWN_MS) {
+      d.lastShake = now; d.flips = [];
+      shakeEntity(d.e);
+    }
+  }
+  function onUp(ev) {
+    audio.unlock();
+    if (game.started) requestMotion();
+    const d = drags.get(ev.pointerId);
+    if (!d) return;
+    drags.delete(ev.pointerId);
+    const e = d.e;
+    e.dragging = false;
+    if (d.moved < TAP_MAX_MOVE && performance.now() - d.st < TAP_MAX_MS) { tapEntity(e); return; }
+    e.vx = clamp(e.vx, -1600, 1600); e.vy = clamp(e.vy, -1600, 1600);
+  }
+
+  // shaking the phone itself, where the browser allows motion access
+  let motionAsked = false, lastDeviceShake = 0;
+  function requestMotion() {
+    if (motionAsked) return;
+    motionAsked = true;
+    const DME = window.DeviceMotionEvent;
+    if (!DME) return;
+    const listen = () => window.addEventListener('devicemotion', onMotion);
+    if (typeof DME.requestPermission !== 'function') { listen(); return; }
+    DME.requestPermission()
+      .then(state => { if (state === 'granted') listen(); })
+      .catch(() => { /* motion refused or unavailable: shaking with a finger still works */ });
+  }
+  function onMotion(ev) {
+    const a = ev.acceleration, g = ev.accelerationIncludingGravity;
+    let mag = 0;
+    if (a && a.x != null) mag = Math.hypot(a.x, a.y, a.z);
+    else if (g && g.x != null) mag = Math.abs(Math.hypot(g.x, g.y, g.z) - 9.8);
+    const now = performance.now();
+    if (mag < DEVICE_SHAKE_ACCEL || now - lastDeviceShake < DEVICE_SHAKE_COOLDOWN_MS) return;
+    lastDeviceShake = now;
+    shakeAll();
+  }
+  function shakeAll() {
+    game.quake = 12;
+    const targets = game.entities.filter(e => !e.dying).slice(-12);
+    for (const e of targets) { fling(e, 500); KINDS[e.kind].shake(e); }
+    if (targets.length) addProgress(2);
+  }
+
+  // ---------- loop ----------
+  let last = performance.now();
+  function update(dt) {
+    updateButton(dt);
+    updateTransition(dt);
+    updateFinale(dt);
+    updateAmbient(dt);
+    for (const e of game.entities) stepEntity(e, dt);
+    game.entities = game.entities.filter(e => !e.dead);
+    stepParticles(dt);
+  }
+  function render() {
+    drawBackground();
+    ctx.save();
+    if (!REDUCED && game.quake > 0.3) ctx.translate(rand(-1, 1) * game.quake, rand(-1, 1) * game.quake);
+    for (const e of game.entities) drawEntity(e);
+    drawButton();
+    for (const p of game.particles) drawParticle(p);
+    ctx.restore();
+    drawVignette();
+    drawPeek();
+    drawDarkness();
+    drawTransitionOverlay();
+  }
+  function frame(now) {
+    const dt = Math.min(0.05, Math.max(0, (now - last) / 1000));
+    last = now;
+    game.time += dt;
+    update(dt);
+    render();
+    requestAnimationFrame(frame);
+  }
+
+  function start(saved) {
+    if (saved && Number.isInteger(saved.era) && saved.era >= 0 && saved.era < 4) {
+      game.era = saved.era;
+      game.progress = clamp(Number(saved.progress) || 0, 0, ERA_LENGTH - 1);
+      game.started = game.era > 0 || game.progress > 0;
+    }
+    game.bg = [...BG[game.era]];
+    resize();
+    window.addEventListener('resize', resize);
+    canvas.addEventListener('pointerdown', onDown, { passive: false });
+    window.addEventListener('pointermove', onMove, { passive: false });
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+    canvas.addEventListener('contextmenu', ev => ev.preventDefault());
+    document.addEventListener('touchmove', ev => ev.preventDefault(), { passive: false });
+    document.addEventListener('gesturestart', ev => ev.preventDefault());
+    document.addEventListener('dblclick', ev => ev.preventDefault());
+    document.addEventListener('visibilitychange', () => {
+      if (!audio.ctx) return;
+      const change = document.hidden ? audio.ctx.suspend() : audio.ctx.resume();
+      change.catch(() => { /* the next touch resumes sound */ });
+    });
+    requestAnimationFrame(t => { last = t; frame(t); });
+  }
+
+  const hot = window.claude?.hot;
+  if (hot && typeof hot.snapshot === 'function') hot.snapshot(() => ({ era: game.era, progress: game.progress }));
+  if (hot && typeof hot.ready === 'function') hot.ready(start); else start(hot?.data ?? {});
+})();
+</script>
